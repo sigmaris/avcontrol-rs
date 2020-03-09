@@ -3,8 +3,7 @@ use mqtt::control::variable_header::ConnectReturnCode;
 use mqtt::encodable::Decodable;
 use mqtt::encodable::Encodable;
 use mqtt::packet::{
-    ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket,
-    PublishPacket, SubscribePacket, VariablePacket,
+    ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket, SubscribePacket, VariablePacket,
 };
 use mqtt::QualityOfService;
 use mqtt::TopicFilter;
@@ -12,11 +11,11 @@ use std::io::{Cursor, Error, ErrorKind, Write};
 use std::net::Shutdown;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{tcp::ReadHalf, tcp::WriteHalf, TcpStream};
+use tokio::net::{tcp::WriteHalf, TcpStream};
 use tokio::select;
-use tokio::signal::unix::{signal, Signal, SignalKind};
-use tokio::stream::{Stream, StreamExt};
-use tokio::sync::mpsc;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::stream::{StreamExt};
+
 use tokio::time::{delay_for, interval};
 
 mod serial;
