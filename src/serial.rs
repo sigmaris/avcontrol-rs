@@ -1,11 +1,14 @@
 use log::trace;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use phf::phf_map;
 use std::convert::TryFrom;
 use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
-use tokio_serial::{ClearBuffer, DataBits, FlowControl, Parity, Serial, SerialPort, SerialPortSettings, StopBits};
+use tokio_serial::{
+    DataBits, FlowControl, Parity, Serial, SerialPortSettings, StopBits,
+};
 
 static SERIAL_SETTINGS: SerialPortSettings = SerialPortSettings {
     baud_rate: 9600,
@@ -15,10 +18,21 @@ static SERIAL_SETTINGS: SerialPortSettings = SerialPortSettings {
     stop_bits: StopBits::One,
     timeout: Duration::from_secs(1),
 };
+static SWITCH_OPTIONS: phf::Map<&'static str, SwitchOption> = phf_map! {
+    "PS2" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::PS2)), tv: TVInput::Component },
+    "Wii" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Wii)), tv: TVInput::Component },
+    "External" =>      SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::External)),      tv: TVInput::HDMI1 },
+    "Switch" =>        SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Switch)),        tv: TVInput::HDMI1 },
+    "PS4" =>           SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::PS4)),           tv: TVInput::HDMI1 },
+    "Fire TV Stick" => SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::FireTVStick)),   tv: TVInput::HDMI1 },
+    "Dreamcast" =>     SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Dreamcast)),     tv: TVInput::HDMI1 },
+    "Kodi" =>          SwitchOption { input: None, tv: TVInput::HDMI2 },
+    "SCART" =>         SwitchOption { input: None, tv: TVInput::SCART },
+};
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u16)]
-enum TVInput {
+pub enum TVInput {
     Component = 0x300,
     HDMI1 = 0x500,
     HDMI2 = 0x501,
@@ -27,19 +41,29 @@ enum TVInput {
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
-enum ComponentInput {
+pub enum ComponentInput {
     PS2 = 1,
     Wii = 2,
 }
 
 #[derive(IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
-enum HDMIInput {
+pub enum HDMIInput {
     External = 0,
     Switch = 1,
     PS4 = 2,
     FireTVStick = 3,
     Dreamcast = 4,
+}
+
+pub enum CompOrHDMI {
+    Component(ComponentInput),
+    HDMI(HDMIInput),
+}
+
+pub struct SwitchOption {
+    pub input: Option<CompOrHDMI>,
+    pub tv: TVInput,
 }
 
 struct TVSwitch {
@@ -52,16 +76,21 @@ impl TVSwitch {
             TVInput::SCART => {
                 // Scart is a special case - there's no normal serial code for it, so do this:
                 vec![
-                    [0x0a, 0x00, 0x05, 0x01],  // switch to HDMI2
-                    [0x0d, 0x00, 0x00, 0x01],  // press Source key
-                    [0x0d, 0x00, 0x00, 0x61],  // press Down key
-                    [0x0d, 0x00, 0x00, 0x68],  // press Enter key
+                    [0x0a, 0x00, 0x05, 0x01], // switch to HDMI2
+                    [0x0d, 0x00, 0x00, 0x01], // press Source key
+                    [0x0d, 0x00, 0x00, 0x61], // press Down key
+                    [0x0d, 0x00, 0x00, 0x68], // press Enter key
                 ]
             }
             other => {
                 let other_bytes: u16 = other.into();
                 // Bytes 1&2 are always 0x0a 0x00, byte 3 is source and 4 is index (e.g. 0/1 for HDMI1/2)
-                vec![[0x0a, 0x00, ((other_bytes & 0xff00) >> 8) as u8, (other_bytes & 0xff) as u8]]
+                vec![[
+                    0x0a,
+                    0x00,
+                    ((other_bytes & 0xff00) >> 8) as u8,
+                    (other_bytes & 0xff) as u8,
+                ]]
             }
         };
         for [a, b, c, d] in codes {
@@ -157,12 +186,37 @@ impl HDMISwitch {
     }
 }
 
-pub fn get_serial_ports() -> Result<(Serial, Serial, Serial), std::io::Error> {
-    Ok((
-        Serial::from_path("/dev/prolific0", &SERIAL_SETTINGS)?,
-        Serial::from_path("/dev/prolific1", &SERIAL_SETTINGS)?,
-        Serial::from_path("/dev/tvserial", &SERIAL_SETTINGS)?,
-    ))
+pub struct Switcher {
+    component: ComponentSwitch,
+    hdmi: HDMISwitch,
+    tv: TVSwitch,
+}
+
+impl Switcher {
+    pub fn new() -> Result<Switcher, std::io::Error> {
+        Ok(Switcher {
+            component: ComponentSwitch {
+                port: Serial::from_path("/dev/prolific0", &SERIAL_SETTINGS)?,
+            },
+            hdmi: HDMISwitch {
+                port: Serial::from_path("/dev/prolific1", &SERIAL_SETTINGS)?,
+            },
+            tv: TVSwitch {
+                port: Serial::from_path("/dev/tvserial", &SERIAL_SETTINGS)?,
+            },
+        })
+    }
+
+    pub async fn switch_to(&self, input_name: &str) -> Result<(), std::io::Error> {
+        if let Some(sw) = SWITCH_OPTIONS.get(input_name) {
+            Ok(()) // TODO
+        } else {
+            Err(std::io::Error::new(
+                ErrorKind::Other,
+                format!("Unknown input to switch to {}", input_name),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,7 +257,10 @@ mod tests {
         assert!(rt.block_on(f).is_err())
     }
 
-    async fn do_cswitch(input: ComponentInput, response: [u8; 2]) -> Result<(u8, [u8; 2]), std::io::Error> {
+    async fn do_cswitch(
+        input: ComponentInput,
+        response: [u8; 2],
+    ) -> Result<(u8, [u8; 2]), std::io::Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = ComponentSwitch { port: s2 };
 
@@ -244,5 +301,49 @@ mod tests {
             let f = do_hswitch(HDMIInput::try_from(p).unwrap());
             assert_eq!(rt.block_on(f).unwrap(), format!("port{}R", p).as_bytes());
         }
+    }
+
+    async fn do_tvswitch(input: TVInput, expected_size: usize) -> Result<Vec<u8>, std::io::Error> {
+        let (s1, s2) = Serial::pair().unwrap();
+        let mut sw = TVSwitch { port: s2 };
+        sw.switch_to(input).await?;
+        let mut output = Vec::with_capacity(expected_size);
+        s1.take(expected_size as u64)
+            .read_to_end(&mut output)
+            .await?;
+        Ok(output)
+    }
+
+    #[test]
+    fn test_tvswitch() {
+        env_logger::init();
+        let mut rt = Runtime::new().unwrap();
+
+        let f1 = do_tvswitch(TVInput::Component, 7);
+        assert_eq!(
+            rt.block_on(f1).unwrap(),
+            vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
+        );
+
+        let f2 = do_tvswitch(TVInput::HDMI1, 7);
+        assert_eq!(
+            rt.block_on(f2).unwrap(),
+            vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        );
+
+        let f3 = do_tvswitch(TVInput::HDMI2, 7);
+        assert_eq!(
+            rt.block_on(f3).unwrap(),
+            vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6]
+        );
+
+        let f4 = do_tvswitch(TVInput::SCART, 28);
+        assert_eq!(
+            rt.block_on(f4).unwrap(),
+            vec![
+                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
+                0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
+            ]
+        );
     }
 }

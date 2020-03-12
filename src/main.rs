@@ -3,22 +3,24 @@ use mqtt::control::variable_header::ConnectReturnCode;
 use mqtt::encodable::Decodable;
 use mqtt::encodable::Encodable;
 use mqtt::packet::{
-    ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket, SubscribePacket, VariablePacket,
+    ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket,
+    SubscribePacket, VariablePacket,
 };
 use mqtt::QualityOfService;
 use mqtt::TopicFilter;
-use std::io::{Cursor, Error, ErrorKind, Write};
+
+use std::io::{Cursor, Error, ErrorKind};
 use std::net::Shutdown;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::WriteHalf, TcpStream};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::stream::{StreamExt};
-
+use tokio::stream::StreamExt;
 use tokio::time::{delay_for, interval};
 
 mod serial;
+use serial::Switcher;
 
 static MQTT_ADDR: &str = "beefy.sigmaris.info:1883";
 const KEEP_ALIVE: u16 = 50;
@@ -44,7 +46,7 @@ async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
     cp.set_clean_session(true);
     cp.set_keep_alive(KEEP_ALIVE);
 
-    trace!(">CONNECT {:?}", cp);
+    trace!(">M CONNECT {:?}", cp);
 
     let mut buf = Vec::new();
     cp.encode(&mut buf).unwrap();
@@ -52,7 +54,7 @@ async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut in_buf = [0; 4];
     stream.read_exact(&mut in_buf).await?;
     let connack = ConnackPacket::decode(&mut Cursor::new(&mut in_buf))?;
-    trace!("<CONNACK {:?}", connack);
+    trace!("<M CONNACK {:?}", connack);
     debug!("Connection acknowledged");
     if connack.connect_return_code() != ConnectReturnCode::ConnectionAccepted {
         Err(Box::new(Error::new(
@@ -70,6 +72,7 @@ async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
 async fn handle_packet(
     packet: &VariablePacket,
     writer: &mut WriteHalf<'_>,
+    switcher: &mut Switcher,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match packet {
         VariablePacket::PingrespPacket(..) => {
@@ -78,7 +81,7 @@ async fn handle_packet(
         VariablePacket::PingreqPacket(..) => {
             debug!("Sending ping response to broker");
             let pingresp = PingrespPacket::new();
-            trace!(">PINGRESP {:?}", pingresp);
+            trace!(">M PINGRESP {:?}", pingresp);
             let mut buf = Vec::new();
             pingresp.encode(&mut buf).unwrap();
             writer.write_all(&buf).await?
@@ -89,6 +92,11 @@ async fn handle_packet(
                 publ.topic_name(),
                 publ.payload_ref()
             );
+            if let Ok(input_name) = std::str::from_utf8(publ.payload_ref()) {
+                switcher.switch_to(input_name).await?;
+            } else {
+                warn!("{:?} is invalid UTF-8", publ.payload_ref())
+            }
         }
         foo => debug!("Unhandled packet: {:?}", foo),
     }
@@ -97,7 +105,7 @@ async fn handle_packet(
 
 async fn send_disconnect(writer: &mut WriteHalf<'_>) {
     let disconn = DisconnectPacket::new();
-    trace!(">DISCONNECT {:?}", disconn);
+    trace!(">M DISCONNECT {:?}", disconn);
     let mut buf = Vec::new();
     disconn.encode(&mut buf).unwrap();
     writer.write_all(&buf).await.ok();
@@ -108,6 +116,7 @@ async fn main_loop(
     sigint: &mut tokio::signal::unix::Signal,
     sigterm: &mut tokio::signal::unix::Signal,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut switcher = serial::Switcher::new()?;
     let (mut mqtt_read, mut mqtt_write) = stream.split();
     let packet_id: u16 = rand::random();
     let sub = SubscribePacket::new(
@@ -117,7 +126,7 @@ async fn main_loop(
             QualityOfService::Level0,
         )],
     );
-    trace!(">SUBSCRIBE {:?}", sub);
+    trace!(">M SUBSCRIBE {:?}", sub);
     let mut buf = Vec::new();
     sub.encode(&mut buf)?;
     mqtt_write.write_all(&buf).await?;
@@ -129,7 +138,7 @@ async fn main_loop(
             Some(_) = ping_stream.next() => {
                 debug!("Sending PINGREQ to broker");
                 let pingreq = PingreqPacket::new();
-                trace!(">PINGREQ {:?}", pingreq);
+                trace!(">M PINGREQ {:?}", pingreq);
                 let mut buf = Vec::new();
                 pingreq.encode(&mut buf).unwrap();
                 mqtt_write.write_all(&buf).await?
@@ -145,8 +154,8 @@ async fn main_loop(
                 return Ok(());
             }
             Ok(packet) = VariablePacket::parse(&mut mqtt_read) => {
-                trace!("<PACKET {:?}", packet);
-                handle_packet(&packet, &mut mqtt_write).await?;
+                trace!("<M PACKET {:?}", packet);
+                handle_packet(&packet, &mut mqtt_write, &mut switcher).await?;
             }
             else => break
         }
@@ -170,6 +179,7 @@ async fn main() {
         let ended = main_loop(result.unwrap(), &mut sigint, &mut sigterm).await;
         if ended.is_err() {
             info!("Main loop ended, reconnecting: {:?}", ended);
+            delay_for(Duration::from_secs(1)).await;
         } else {
             break;
         }
