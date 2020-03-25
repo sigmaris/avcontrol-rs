@@ -1,14 +1,11 @@
 use log::{debug, info, trace, warn};
 use mqtt::control::variable_header::ConnectReturnCode;
-use mqtt::encodable::Decodable;
-use mqtt::encodable::Encodable;
+use mqtt::encodable::{Decodable, Encodable};
 use mqtt::packet::{
     ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket,
-    SubscribePacket, VariablePacket,
+    SubscribePacket, VariablePacket, PublishPacket, publish::QoSWithPacketIdentifier
 };
-use mqtt::QualityOfService;
-use mqtt::TopicFilter;
-
+use mqtt::{QualityOfService, TopicFilter, TopicName};
 use std::io::{Cursor, Error, ErrorKind};
 use std::net::Shutdown;
 use std::time::Duration;
@@ -93,7 +90,19 @@ async fn handle_packet(
                 publ.payload_ref()
             );
             if let Ok(input_name) = std::str::from_utf8(publ.payload_ref()) {
-                switcher.switch_to(input_name).await?;
+                if let Err(err) = switcher.switch_to(input_name).await {
+                    warn!("Error switching to {}: {}", input_name, err);
+                } else {
+                    info!("Switched OK to {}", input_name);
+                    let switchedto_pkt = PublishPacket::new(
+                        TopicName::new("avcontrol/switchedto").unwrap(),
+                        QoSWithPacketIdentifier::Level0,
+                        publ.payload_ref().clone()
+                    );
+                    let mut buf = Vec::new();
+                    switchedto_pkt.encode(&mut buf)?;
+                    writer.write_all(&buf).await?;
+                }
             } else {
                 warn!("{:?} is invalid UTF-8", publ.payload_ref())
             }
@@ -113,10 +122,10 @@ async fn send_disconnect(writer: &mut WriteHalf<'_>) {
 
 async fn main_loop(
     mut stream: TcpStream,
+    switcher: &mut Switcher,
     sigint: &mut tokio::signal::unix::Signal,
     sigterm: &mut tokio::signal::unix::Signal,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut switcher = serial::Switcher::new()?;
     let (mut mqtt_read, mut mqtt_write) = stream.split();
     let packet_id: u16 = rand::random();
     let sub = SubscribePacket::new(
@@ -155,7 +164,7 @@ async fn main_loop(
             }
             Ok(packet) = VariablePacket::parse(&mut mqtt_read) => {
                 trace!("<M PACKET {:?}", packet);
-                handle_packet(&packet, &mut mqtt_write, &mut switcher).await?;
+                handle_packet(&packet, &mut mqtt_write, switcher).await?;
             }
             else => break
         }
@@ -167,16 +176,17 @@ async fn main_loop(
 #[tokio::main]
 async fn main() {
     log_init().expect("Failed logger init");
+    let mut switcher = serial::Switcher::new().expect("Couldn't open serial ports");
     let mut sigint = signal(SignalKind::interrupt()).expect("Can't listen for SIGINT");
     let mut sigterm = signal(SignalKind::terminate()).expect("Can't listen for SIGTERM");
     loop {
         let mut result = connect().await;
         while result.is_err() {
-            warn!("Connect failed, retrying: {:?}", result);
+            warn!("MQTT Connect failed, retrying: {:?}", result);
             delay_for(Duration::from_secs(2)).await;
             result = connect().await;
         }
-        let ended = main_loop(result.unwrap(), &mut sigint, &mut sigterm).await;
+        let ended = main_loop(result.unwrap(), &mut switcher, &mut sigint, &mut sigterm).await;
         if ended.is_err() {
             info!("Main loop ended, reconnecting: {:?}", ended);
             delay_for(Duration::from_secs(1)).await;
