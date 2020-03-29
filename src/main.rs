@@ -108,7 +108,7 @@ async fn handle_packet(
                 warn!("{:?} is invalid UTF-8", publ.payload_ref())
             }
         }
-        foo => debug!("Unhandled packet: {:?}", foo),
+        other => debug!("Unhandled packet: {:?}", other),
     }
     Ok(())
 }

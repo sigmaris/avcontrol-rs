@@ -161,13 +161,13 @@ impl ComponentSwitch {
         }
     }
 
-    pub async fn switch_to(&mut self, input: &ComponentInput) -> Result<u8, std::io::Error> {
+    pub async fn switch_to(&mut self, input: ComponentInput) -> Result<u8, std::io::Error> {
         if !self.power_status().await.unwrap_or_default() {
             self.power_on().await.ok();
         }
 
         let output: u8 = 1; // Output for component to TV - we're using output 1
-        let input_byte: u8 = (*input).into();
+        let input_byte: u8 = input.into();
         let selector = ((input_byte * 16) + 128) | output;
 
         trace!(">C {:x?}", [0x01, selector]);
@@ -189,8 +189,8 @@ struct HDMISwitch {
 }
 
 impl HDMISwitch {
-    pub async fn switch_to(&mut self, input: &HDMIInput) -> Result<(), std::io::Error> {
-        let selector = Into::<u8>::into(*input) + 0x30;
+    pub async fn switch_to(&mut self, input: HDMIInput) -> Result<(), std::io::Error> {
+        let selector = Into::<u8>::into(input) + 0x30;
         trace!(">H {:x?}", &HDMI_PORT_STR);
         trace!(">H {:x?}", &[selector, 0x52]);
         self.port.write_all(&HDMI_PORT_STR).await?;
@@ -239,8 +239,8 @@ impl Switcher {
             let tv_future = self.tv.switch_to(sw.tv);
             match sw.input {
                 Some(CompOrHDMI::Component(comp_input)) =>
-                    try_join![self.component.switch_to(&comp_input), tv_future].map(|_| ()),
-                Some(CompOrHDMI::HDMI(hdmi_input)) => try_join![self.hdmi.switch_to(&hdmi_input), tv_future].map(|_| ()),
+                    try_join![self.component.switch_to(comp_input), tv_future].map(|_| ()),
+                Some(CompOrHDMI::HDMI(hdmi_input)) => try_join![self.hdmi.switch_to(hdmi_input), tv_future].map(|_| ()),
                 None => tv_future.await
             }
         } else {
@@ -302,7 +302,7 @@ mod tests {
         s1.write_all(&[0x63, 0x81]).await?;
         s1.write_all(&response).await?;
 
-        let port = sw.switch_to(&input).await?;
+        let port = sw.switch_to(input).await?;
 
         let mut buf = [0; 2];
         s1.read_u16().await?;
@@ -323,7 +323,7 @@ mod tests {
     async fn do_hswitch(input: HDMIInput) -> Result<[u8; 6], std::io::Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = HDMISwitch { port: s2 };
-        sw.switch_to(&input).await?;
+        sw.switch_to(input).await?;
         let mut buf = [0; 6];
         s1.read_exact(&mut buf).await?;
         Ok(buf)
