@@ -5,6 +5,7 @@ use phf::phf_map;
 use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::delay_for;
 use tokio::try_join;
 use tokio_serial::{
     DataBits, FlowControl, Parity, Serial, SerialPortSettings, StopBits,
@@ -76,9 +77,13 @@ struct TVSwitch {
 
 impl TVSwitch {
     pub async fn switch_to(&mut self, input: TVInput) -> Result<(), std::io::Error> {
+        let mut delay = false;
         let codes: Vec<[u8; 4]> = match input {
             TVInput::SCART => {
                 // Scart is a special case - there's no normal serial code for it, so do this:
+                // If not running unit tests, delay between each command to let the TV respond
+                delay = !cfg!(test);
+                // Send a sequence of commands to switch to SCART
                 vec![
                     [0x0a, 0x00, 0x05, 0x01], // switch to HDMI2
                     [0x0d, 0x00, 0x00, 0x01], // press Source key
@@ -107,6 +112,9 @@ impl TVSwitch {
 
             self.port.write_all(&prefixed_cmd).await?;
             self.port.write_u8(checksum).await?;
+            if delay {
+                delay_for(Duration::from_millis(500)).await
+            }
         }
         Ok(())
     }
