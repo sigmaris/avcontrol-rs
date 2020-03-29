@@ -2,7 +2,7 @@ use log::trace;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use phf::phf_map;
 
-use std::io::ErrorKind;
+use std::io::{Error, ErrorKind};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::delay_for;
@@ -76,7 +76,7 @@ struct TVSwitch {
 }
 
 impl TVSwitch {
-    pub async fn switch_to(&mut self, input: TVInput) -> Result<(), std::io::Error> {
+    pub async fn switch_to(&mut self, input: TVInput) -> Result<(), Error> {
         let mut delay = false;
         let codes: Vec<[u8; 4]> = match input {
             TVInput::SCART => {
@@ -126,7 +126,7 @@ struct ComponentSwitch {
 
 impl ComponentSwitch {
     // Is power on, off, or unknown (error)?
-    pub async fn power_status(&mut self) -> Result<bool, std::io::Error> {
+    pub async fn power_status(&mut self) -> Result<bool, Error> {
         trace!(">C {:x?}", [0x05, 0x00]);
         self.port.write_all(&[0x05, 0x00]).await?;
 
@@ -137,14 +137,14 @@ impl ComponentSwitch {
         match buf {
             [0x63, 0x81] => Ok(true),
             [0x64, 0x80] => Ok(false),
-            _ => Err(std::io::Error::new(
+            _ => Err(Error::new(
                 ErrorKind::Other,
                 format!("Unknown power_status: {:?}", buf),
             )),
         }
     }
 
-    pub async fn power_on(&mut self) -> Result<(), std::io::Error> {
+    pub async fn power_on(&mut self) -> Result<(), Error> {
         trace!(">C {:x?}", [0x03, 0x00]);
         self.port.write_all(&[0x03, 0x00]).await?;
 
@@ -154,14 +154,14 @@ impl ComponentSwitch {
 
         match buf {
             [0x63, 0x81] => Ok(()),
-            _ => Err(std::io::Error::new(
+            _ => Err(Error::new(
                 ErrorKind::Other,
                 format!("Got an odd response after power-on: {:?}", buf),
             )),
         }
     }
 
-    pub async fn switch_to(&mut self, input: ComponentInput) -> Result<u8, std::io::Error> {
+    pub async fn switch_to(&mut self, input: ComponentInput) -> Result<u8, Error> {
         if !self.power_status().await.unwrap_or_default() {
             self.power_on().await.ok();
         }
@@ -189,7 +189,7 @@ struct HDMISwitch {
 }
 
 impl HDMISwitch {
-    pub async fn switch_to(&mut self, input: HDMIInput) -> Result<(), std::io::Error> {
+    pub async fn switch_to(&mut self, input: HDMIInput) -> Result<(), Error> {
         let selector = Into::<u8>::into(input) + 0x30;
         trace!(">H {:x?}", &HDMI_PORT_STR);
         trace!(">H {:x?}", &[selector, 0x52]);
@@ -205,7 +205,7 @@ pub struct Switcher {
 }
 
 impl Switcher {
-    pub fn new() -> Result<Switcher, std::io::Error> {
+    pub fn new() -> Result<Switcher, Error> {
         Ok(Switcher {
             component: ComponentSwitch {
                 port: Serial::from_path(COMP_SWITCH_DEV, &SERIAL_SETTINGS)?,
@@ -234,7 +234,7 @@ impl Switcher {
         }
     }
 
-    pub async fn switch_to(&mut self, input_name: &str) -> Result<(), std::io::Error> {
+    pub async fn switch_to(&mut self, input_name: &str) -> Result<(), Error> {
         if let Some(sw) = SWITCH_OPTIONS.get(input_name) {
             let tv_future = self.tv.switch_to(sw.tv);
             match sw.input {
@@ -244,7 +244,7 @@ impl Switcher {
                 None => tv_future.await
             }
         } else {
-            Err(std::io::Error::new(
+            Err(Error::new(
                 ErrorKind::Other,
                 format!("Unknown input to switch to {}", input_name),
             ))
@@ -259,7 +259,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::runtime::Runtime;
 
-    async fn test_power(response: [u8; 2]) -> Result<(bool, [u8; 2]), std::io::Error> {
+    async fn test_power(response: [u8; 2]) -> Result<(bool, [u8; 2]), Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = ComponentSwitch { port: s2 };
         s1.write_all(&response).await?;
@@ -295,7 +295,7 @@ mod tests {
     async fn do_cswitch(
         input: ComponentInput,
         response: [u8; 2],
-    ) -> Result<(u8, [u8; 2]), std::io::Error> {
+    ) -> Result<(u8, [u8; 2]), Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = ComponentSwitch { port: s2 };
 
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(rt.block_on(f2).unwrap(), (2, [0x01, 0xa1]));
     }
 
-    async fn do_hswitch(input: HDMIInput) -> Result<[u8; 6], std::io::Error> {
+    async fn do_hswitch(input: HDMIInput) -> Result<[u8; 6], Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = HDMISwitch { port: s2 };
         sw.switch_to(input).await?;
@@ -338,7 +338,7 @@ mod tests {
         }
     }
 
-    async fn do_tvswitch(input: TVInput, expected_size: usize) -> Result<Vec<u8>, std::io::Error> {
+    async fn do_tvswitch(input: TVInput, expected_size: usize) -> Result<Vec<u8>, Error> {
         let (s1, s2) = Serial::pair().unwrap();
         let mut sw = TVSwitch { port: s2 };
         sw.switch_to(input).await?;
@@ -384,7 +384,7 @@ mod tests {
         );
     }
 
-    async fn do_switch(input: &str, comp_response: &[u8; 2], expected_responses: [Vec<u8>; 3]) -> Result<(), std::io::Error> {
+    async fn do_switch(input: &str, comp_response: &[u8; 2], expected_responses: [Vec<u8>; 3]) -> Result<(), Error> {
         let (mut c1, c2) = Serial::pair().unwrap();
         let (h1, h2) = Serial::pair().unwrap();
         let (t1, t2) = Serial::pair().unwrap();
