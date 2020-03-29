@@ -94,11 +94,12 @@ async fn handle_packet(
                     warn!("Error switching to {}: {}", input_name, err);
                 } else {
                     info!("Switched OK to {}", input_name);
-                    let switchedto_pkt = PublishPacket::new(
+                    let mut switchedto_pkt = PublishPacket::new(
                         TopicName::new("avcontrol/switchedto").unwrap(),
                         QoSWithPacketIdentifier::Level0,
                         publ.payload_ref().clone()
                     );
+                    switchedto_pkt.set_retain(true);
                     let mut buf = Vec::new();
                     switchedto_pkt.encode(&mut buf)?;
                     writer.write_all(&buf).await?;
