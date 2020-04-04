@@ -145,19 +145,29 @@ impl ComponentSwitch {
     }
 
     pub async fn power_on(&mut self) -> Result<(), Error> {
-        trace!(">C {:x?}", [0x03, 0x00]);
-        self.port.write_all(&[0x03, 0x00]).await?;
+        self.set_power(true).await
+    }
+
+    pub async fn power_off(&mut self) -> Result<(), Error> {
+        self.set_power(false).await
+    }
+
+    pub async fn set_power(&mut self, state: bool) -> Result<(), Error> {
+        let (byte, expected) = if state { (0x03, [0x63, 0x81]) } else { (0x04, [0x64, 0x80]) };
+        trace!(">C {:x?}", [byte, 0x00]);
+        self.port.write_all(&[byte, 0x00]).await?;
 
         let mut buf = [0; 2];
         self.port.read_exact(&mut buf).await?;
         trace!("<C {:x?}", buf);
 
-        match buf {
-            [0x63, 0x81] => Ok(()),
-            _ => Err(Error::new(
+        if buf == expected {
+            Ok(())
+        } else {
+            Err(Error::new(
                 ErrorKind::Other,
-                format!("Got an odd response after power-on: {:?}", buf),
-            )),
+                format!("Got an odd response after power-{}: {:?}", if state {"on"} else {"off"}, buf),
+            ))
         }
     }
 
@@ -181,20 +191,26 @@ impl ComponentSwitch {
     }
 }
 
-// "port" in ASCII
-const HDMI_PORT_STR: [u8; 4] = [0x70, 0x6f, 0x72, 0x74];
-
 struct HDMISwitch {
     port: Serial,
 }
 
 impl HDMISwitch {
     pub async fn switch_to(&mut self, input: HDMIInput) -> Result<(), Error> {
+        self.power_on().await?;
         let selector = Into::<u8>::into(input) + 0x30;
-        trace!(">H {:x?}", &HDMI_PORT_STR);
+        trace!(">H {:x?}", b"port");
         trace!(">H {:x?}", &[selector, 0x52]);
-        self.port.write_all(&HDMI_PORT_STR).await?;
+        self.port.write_all(b"port").await?;
         self.port.write_all(&[selector, 0x52]).await
+    }
+
+    pub async fn power_on(&mut self) -> Result<(), Error> {
+        self.port.write_all(b"poweronR").await
+    }
+
+    pub async fn power_off(&mut self) -> Result<(), Error> {
+        self.port.write_all(b"poweroffR").await
     }
 }
 
@@ -236,12 +252,13 @@ impl Switcher {
 
     pub async fn switch_to(&mut self, input_name: &str) -> Result<(), Error> {
         if let Some(sw) = SWITCH_OPTIONS.get(input_name) {
-            let tv_future = self.tv.switch_to(sw.tv);
+            let tv_fut = self.tv.switch_to(sw.tv);
             match sw.input {
                 Some(CompOrHDMI::Component(comp_input)) =>
-                    try_join![self.component.switch_to(comp_input), tv_future].map(|_| ()),
-                Some(CompOrHDMI::HDMI(hdmi_input)) => try_join![self.hdmi.switch_to(hdmi_input), tv_future].map(|_| ()),
-                None => tv_future.await
+                    try_join![self.component.switch_to(comp_input), self.hdmi.power_off(), tv_fut].map(|_| ()),
+                Some(CompOrHDMI::HDMI(hdmi_input)) =>
+                    try_join![self.component.power_off(), self.hdmi.switch_to(hdmi_input), tv_fut].map(|_| ()),
+                None => try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ())
             }
         } else {
             Err(Error::new(
@@ -324,6 +341,8 @@ mod tests {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = HDMISwitch { port: s2 };
         sw.switch_to(input).await?;
+        let mut power_buf = [0; 8];
+        s1.read_exact(&mut power_buf).await?;
         let mut buf = [0; 6];
         s1.read_exact(&mut buf).await?;
         Ok(buf)
@@ -384,12 +403,11 @@ mod tests {
         );
     }
 
-    async fn do_switch(input: &str, comp_response: &[u8; 2], expected_responses: [Vec<u8>; 3]) -> Result<(), Error> {
+    async fn do_switch(input: &str, comp_response: &[u8; 4], expected_responses: [Vec<u8>; 3]) -> Result<(), Error> {
         let (mut c1, c2) = Serial::pair().unwrap();
         let (h1, h2) = Serial::pair().unwrap();
         let (t1, t2) = Serial::pair().unwrap();
         let mut switcher = Switcher::test_new(c2, h2, t2);
-        c1.write_all(&[0x63, 0x81]).await?;
         c1.write_all(comp_response).await?;
         switcher.switch_to(input).await?;
         let mut comp_out = Vec::with_capacity(expected_responses[0].len());
@@ -408,43 +426,47 @@ mod tests {
     fn test_switcher() {
         let mut rt = Runtime::new().unwrap();
 
-        rt.block_on(do_switch("PS2", &[0x61, 0x91], [
-            vec![0x05, 0x00, 0x01, 0x91], vec![], vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
+        rt.block_on(do_switch("PS2", &[0x63, 0x81, 0x61, 0x91], [
+            vec![0x05, 0x00, 0x01, 0x91], "poweroffR".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
         ])).unwrap();
 
-        rt.block_on(do_switch("Wii", &[0x61, 0xa1], [
-            vec![0x05, 0x00, 0x01, 0xa1], vec![], vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
+        rt.block_on(do_switch("Wii", &[0x63, 0x81, 0x61, 0xa1], [
+            vec![0x05, 0x00, 0x01, 0xa1], "poweroffR".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
         ])).unwrap();
 
-        rt.block_on(do_switch("External", &[0, 0], [
-            vec![], vec![0x70, 0x6f, 0x72, 0x74, 0x30, 0x52], vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        rt.block_on(do_switch("External", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweronRport0R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
         ])).unwrap();
 
-        rt.block_on(do_switch("Switch", &[0, 0], [
-            vec![], vec![0x70, 0x6f, 0x72, 0x74, 0x31, 0x52], vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        rt.block_on(do_switch("Switch", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweronRport1R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
         ])).unwrap();
 
-        rt.block_on(do_switch("PS4", &[0, 0], [
-            vec![], vec![0x70, 0x6f, 0x72, 0x74, 0x32, 0x52], vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        rt.block_on(do_switch("PS4", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweronRport2R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
         ])).unwrap();
 
-        rt.block_on(do_switch("Fire TV Stick", &[0, 0], [
-            vec![], vec![0x70, 0x6f, 0x72, 0x74, 0x33, 0x52], vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        rt.block_on(do_switch("Fire TV Stick", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweronRport3R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
         ])).unwrap();
 
-        rt.block_on(do_switch("Dreamcast", &[0, 0], [
-            vec![], vec![0x70, 0x6f, 0x72, 0x74, 0x34, 0x52], vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
+        rt.block_on(do_switch("Dreamcast", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweronRport4R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
         ])).unwrap();
 
-        rt.block_on(do_switch("Kodi", &[0,0], [vec![], vec![], vec![
-            0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
-        ]])).unwrap();
+        rt.block_on(do_switch("Kodi", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweroffR".into(), vec![
+                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
+            ]
+        ])).unwrap();
 
-        rt.block_on(do_switch("SCART", &[0,0], [vec![], vec![], vec![
-            0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
-            0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
-            0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68,
-            0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
-        ]])).unwrap();
+        rt.block_on(do_switch("SCART", &[0x64, 0x80, 0, 0], [
+            vec![0x04, 0x00], "poweroffR".into(), vec![
+                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
+                0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
+                0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68,
+                0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
+            ]
+        ])).unwrap();
     }
 }
