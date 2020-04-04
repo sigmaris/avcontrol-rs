@@ -153,9 +153,9 @@ impl ComponentSwitch {
     }
 
     pub async fn set_power(&mut self, state: bool) -> Result<(), Error> {
-        let (byte, expected) = if state { (0x03, [0x63, 0x81]) } else { (0x04, [0x64, 0x80]) };
-        trace!(">C {:x?}", [byte, 0x00]);
-        self.port.write_all(&[byte, 0x00]).await?;
+        let (cmd_byte, expected) = if state { (0x03, [0x63, 0x81]) } else { (0x04, [0x64, 0x80]) };
+        trace!(">C {:x?}", [cmd_byte, 0x00]);
+        self.port.write_all(&[cmd_byte, 0x00]).await?;
 
         let mut buf = [0; 2];
         self.port.read_exact(&mut buf).await?;
@@ -174,6 +174,7 @@ impl ComponentSwitch {
     pub async fn switch_to(&mut self, input: ComponentInput) -> Result<u8, Error> {
         if !self.power_status().await.unwrap_or_default() {
             self.power_on().await.ok();
+            delay_for(Duration::from_millis(500)).await;
         }
 
         let output: u8 = 1; // Output for component to TV - we're using output 1
@@ -193,11 +194,15 @@ impl ComponentSwitch {
 
 struct HDMISwitch {
     port: Serial,
+    power_state: bool,
 }
 
 impl HDMISwitch {
     pub async fn switch_to(&mut self, input: HDMIInput) -> Result<(), Error> {
-        self.power_on().await?;
+        if !self.power_state {
+            self.power_on().await?;
+            delay_for(Duration::from_millis(500)).await;
+        }
         let selector = Into::<u8>::into(input) + 0x30;
         trace!(">H {:x?}", b"port");
         trace!(">H {:x?}", &[selector, 0x52]);
@@ -206,11 +211,17 @@ impl HDMISwitch {
     }
 
     pub async fn power_on(&mut self) -> Result<(), Error> {
-        self.port.write_all(b"poweronR").await
+        trace!(">H {:x?}", b"poweronR");
+        self.port.write_all(b"poweronR").await?;
+        self.power_state = true;
+        Ok(())
     }
 
     pub async fn power_off(&mut self) -> Result<(), Error> {
-        self.port.write_all(b"poweroffR").await
+        trace!(">H {:x?}", b"poweroffR");
+        self.port.write_all(b"poweroffR").await?;
+        self.power_state = false;
+        Ok(())
     }
 }
 
@@ -228,6 +239,7 @@ impl Switcher {
             },
             hdmi: HDMISwitch {
                 port: Serial::from_path(HDMI_SWITCH_DEV, &SERIAL_SETTINGS)?,
+                power_state: false,
             },
             tv: TVSwitch {
                 port: Serial::from_path(TV_SWITCH_DEV, &SERIAL_SETTINGS)?,
@@ -243,6 +255,7 @@ impl Switcher {
             },
             hdmi: HDMISwitch {
                 port: hdmi,
+                power_state: false,
             },
             tv: TVSwitch {
                 port: tv,
@@ -258,7 +271,7 @@ impl Switcher {
                     try_join![self.component.switch_to(comp_input), self.hdmi.power_off(), tv_fut].map(|_| ()),
                 Some(CompOrHDMI::HDMI(hdmi_input)) =>
                     try_join![self.component.power_off(), self.hdmi.switch_to(hdmi_input), tv_fut].map(|_| ()),
-                None => try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ())
+                None => try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ()),
             }
         } else {
             Err(Error::new(
@@ -339,7 +352,7 @@ mod tests {
 
     async fn do_hswitch(input: HDMIInput) -> Result<[u8; 6], Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
-        let mut sw = HDMISwitch { port: s2 };
+        let mut sw = HDMISwitch { port: s2, power_state: false };
         sw.switch_to(input).await?;
         let mut power_buf = [0; 8];
         s1.read_exact(&mut power_buf).await?;
