@@ -7,12 +7,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::delay_for;
 use tokio::try_join;
-use tokio_serial::{
-    DataBits, FlowControl, Parity, Serial, SerialPortSettings, StopBits,
-};
+use tokio_serial::{DataBits, FlowControl, Parity, Serial, SerialPortSettings, StopBits};
 
-const COMP_SWITCH_DEV: &str = "/dev/prolific0";
-const HDMI_SWITCH_DEV: &str = "/dev/prolific1";
+const COMP_SWITCH_DEV: &str = "/dev/compswitch";
+const HDMI_SWITCH_DEV: &str = "/dev/hdmiswitch";
 const TV_SWITCH_DEV: &str = "/dev/tvserial";
 static SERIAL_SETTINGS: SerialPortSettings = SerialPortSettings {
     baud_rate: 9600,
@@ -153,7 +151,11 @@ impl ComponentSwitch {
     }
 
     pub async fn set_power(&mut self, state: bool) -> Result<(), Error> {
-        let (cmd_byte, expected) = if state { (0x03, [0x63, 0x81]) } else { (0x04, [0x64, 0x80]) };
+        let (cmd_byte, expected) = if state {
+            (0x03, [0x63, 0x81])
+        } else {
+            (0x04, [0x64, 0x80])
+        };
         trace!(">C {:x?}", [cmd_byte, 0x00]);
         self.port.write_all(&[cmd_byte, 0x00]).await?;
 
@@ -166,7 +168,11 @@ impl ComponentSwitch {
         } else {
             Err(Error::new(
                 ErrorKind::Other,
-                format!("Got an odd response after power-{}: {:?}", if state {"on"} else {"off"}, buf),
+                format!(
+                    "Got an odd response after power-{}: {:?}",
+                    if state { "on" } else { "off" },
+                    buf
+                ),
             ))
         }
     }
@@ -250,16 +256,12 @@ impl Switcher {
     #[cfg(test)]
     pub fn test_new(component: Serial, hdmi: Serial, tv: Serial) -> Switcher {
         Switcher {
-            component: ComponentSwitch {
-                port: component,
-            },
+            component: ComponentSwitch { port: component },
             hdmi: HDMISwitch {
                 port: hdmi,
                 power_state: false,
             },
-            tv: TVSwitch {
-                port: tv,
-            },
+            tv: TVSwitch { port: tv },
         }
     }
 
@@ -267,11 +269,21 @@ impl Switcher {
         if let Some(sw) = SWITCH_OPTIONS.get(input_name) {
             let tv_fut = self.tv.switch_to(sw.tv);
             match sw.input {
-                Some(CompOrHDMI::Component(comp_input)) =>
-                    try_join![self.component.switch_to(comp_input), self.hdmi.power_off(), tv_fut].map(|_| ()),
-                Some(CompOrHDMI::HDMI(hdmi_input)) =>
-                    try_join![self.component.power_off(), self.hdmi.switch_to(hdmi_input), tv_fut].map(|_| ()),
-                None => try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ()),
+                Some(CompOrHDMI::Component(comp_input)) => try_join![
+                    self.component.switch_to(comp_input),
+                    self.hdmi.power_off(),
+                    tv_fut
+                ]
+                .map(|_| ()),
+                Some(CompOrHDMI::HDMI(hdmi_input)) => try_join![
+                    self.component.power_off(),
+                    self.hdmi.switch_to(hdmi_input),
+                    tv_fut
+                ]
+                .map(|_| ()),
+                None => {
+                    try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ())
+                }
             }
         } else {
             Err(Error::new(
@@ -322,10 +334,7 @@ mod tests {
         assert!(rt.block_on(f).is_err())
     }
 
-    async fn do_cswitch(
-        input: ComponentInput,
-        response: [u8; 2],
-    ) -> Result<(u8, [u8; 2]), Error> {
+    async fn do_cswitch(input: ComponentInput, response: [u8; 2]) -> Result<(u8, [u8; 2]), Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = ComponentSwitch { port: s2 };
 
@@ -352,7 +361,10 @@ mod tests {
 
     async fn do_hswitch(input: HDMIInput) -> Result<[u8; 6], Error> {
         let (mut s1, s2) = Serial::pair().unwrap();
-        let mut sw = HDMISwitch { port: s2, power_state: false };
+        let mut sw = HDMISwitch {
+            port: s2,
+            power_state: false,
+        };
         sw.switch_to(input).await?;
         let mut power_buf = [0; 8];
         s1.read_exact(&mut power_buf).await?;
@@ -408,15 +420,17 @@ mod tests {
         assert_eq!(
             rt.block_on(f4).unwrap(),
             vec![
-                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
+                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
+                0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
             ]
         );
     }
 
-    async fn do_switch(input: &str, comp_response: &[u8; 4], expected_responses: [Vec<u8>; 3]) -> Result<(), Error> {
+    async fn do_switch(
+        input: &str,
+        comp_response: &[u8; 4],
+        expected_responses: [Vec<u8>; 3],
+    ) -> Result<(), Error> {
         let (mut c1, c2) = Serial::pair().unwrap();
         let (h1, h2) = Serial::pair().unwrap();
         let (t1, t2) = Serial::pair().unwrap();
@@ -426,9 +440,15 @@ mod tests {
         let mut comp_out = Vec::with_capacity(expected_responses[0].len());
         let mut hdmi_out = Vec::with_capacity(expected_responses[1].len());
         let mut tv_out = Vec::with_capacity(expected_responses[2].len());
-        c1.take(expected_responses[0].len() as u64).read_to_end(&mut comp_out).await?;
-        h1.take(expected_responses[1].len() as u64).read_to_end(&mut hdmi_out).await?;
-        t1.take(expected_responses[2].len() as u64).read_to_end(&mut tv_out).await?;
+        c1.take(expected_responses[0].len() as u64)
+            .read_to_end(&mut comp_out)
+            .await?;
+        h1.take(expected_responses[1].len() as u64)
+            .read_to_end(&mut hdmi_out)
+            .await?;
+        t1.take(expected_responses[2].len() as u64)
+            .read_to_end(&mut tv_out)
+            .await?;
         assert_eq!(comp_out, expected_responses[0]);
         assert_eq!(hdmi_out, expected_responses[1]);
         assert_eq!(tv_out, expected_responses[2]);
@@ -439,47 +459,107 @@ mod tests {
     fn test_switcher() {
         let mut rt = Runtime::new().unwrap();
 
-        rt.block_on(do_switch("PS2", &[0x63, 0x81, 0x61, 0x91], [
-            vec![0x05, 0x00, 0x01, 0x91], "poweroffR".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "PS2",
+            &[0x63, 0x81, 0x61, 0x91],
+            [
+                vec![0x05, 0x00, 0x01, 0x91],
+                "poweroffR".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("Wii", &[0x63, 0x81, 0x61, 0xa1], [
-            vec![0x05, 0x00, 0x01, 0xa1], "poweroffR".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "Wii",
+            &[0x63, 0x81, 0x61, 0xa1],
+            [
+                vec![0x05, 0x00, 0x01, 0xa1],
+                "poweroffR".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("External", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweronRport0R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "External",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweronRport0R".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("Switch", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweronRport1R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "Switch",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweronRport1R".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("PS4", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweronRport2R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "PS4",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweronRport2R".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("Fire TV Stick", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweronRport3R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "Fire TV Stick",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweronRport3R".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("Dreamcast", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweronRport4R".into(), vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "Dreamcast",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweronRport4R".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("Kodi", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweroffR".into(), vec![
-                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
-            ]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "Kodi",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweroffR".into(),
+                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6],
+            ],
+        ))
+        .unwrap();
 
-        rt.block_on(do_switch("SCART", &[0x64, 0x80, 0, 0], [
-            vec![0x04, 0x00], "poweroffR".into(), vec![
-                0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x01, 0xc8,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68,
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x68, 0x61,
-            ]
-        ])).unwrap();
+        rt.block_on(do_switch(
+            "SCART",
+            &[0x64, 0x80, 0, 0],
+            [
+                vec![0x04, 0x00],
+                "poweroffR".into(),
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x01,
+                    0xc8, 0x08, 0x22, 0x0d, 0x00, 0x00, 0x61, 0x68, 0x08, 0x22, 0x0d, 0x00, 0x00,
+                    0x68, 0x61,
+                ],
+            ],
+        ))
+        .unwrap();
     }
 }
