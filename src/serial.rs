@@ -1,13 +1,13 @@
-use log::trace;
+use log::{warn, trace};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use phf::phf_map;
 
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::delay_for;
+use tokio::time::{delay_for, timeout};
 use tokio::try_join;
-use tokio_serial::{DataBits, FlowControl, Parity, Serial, SerialPortSettings, StopBits};
+use tokio_serial::{ClearBuffer, DataBits, FlowControl, Parity, Serial, SerialPort, SerialPortSettings, StopBits};
 
 const COMP_SWITCH_DEV: &str = "/dev/compswitch";
 const HDMI_SWITCH_DEV: &str = "/dev/hdmiswitch";
@@ -69,12 +69,36 @@ pub struct SwitchOption {
     pub tv: TVInput,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum  TVResponse {
+    Ok,
+    None,
+    Unexpected([u8; 3])
+}
+
 struct TVSwitch {
     port: Serial,
 }
 
 impl TVSwitch {
+    pub async fn power_status(&mut self) -> Result<bool, Error> {
+        #[cfg(not(test))]
+        self.port.clear(ClearBuffer::Input)?;
+
+        let response = self.send_cmd(&[0x0d, 0x00, 0x00, 0x1f]).await?;  // Info key
+        if response == TVResponse::None {
+            // Empty response indicates TV is Off
+            Ok(false)
+        } else {
+            // Anything else indicates TV is on
+            Ok(true)
+        }
+    }
+
     pub async fn switch_to(&mut self, input: TVInput) -> Result<(), Error> {
+        #[cfg(not(test))]
+        self.port.clear(ClearBuffer::Input)?;
+
         let mut delay = false;
         let codes: Vec<[u8; 4]> = match input {
             TVInput::SCART => {
@@ -100,21 +124,44 @@ impl TVSwitch {
                 ]]
             }
         };
-        for [a, b, c, d] in codes {
-            let prefixed_cmd = [0x08, 0x22, a, b, c, d];
-            let sum: u32 = prefixed_cmd.iter().map(|x| *x as u32).sum();
-            let checksum: u8 = ((256 - sum) % 256) as u8;
-
-            trace!(">T {:x?}", prefixed_cmd);
-            trace!(">T {:x?}", [checksum]);
-
-            self.port.write_all(&prefixed_cmd).await?;
-            self.port.write_u8(checksum).await?;
+        for code in codes {
+            match self.send_cmd(&code).await? {
+                TVResponse::Ok => {}
+                TVResponse::None => return Err(Error::new(ErrorKind::Other, "No response from TV, probably powered off")),
+                TVResponse::Unexpected(ref buf) => warn!("Unexpected response from TV: {:?}", buf),
+            }
+            
             if delay {
                 delay_for(Duration::from_millis(500)).await
             }
         }
         Ok(())
+    }
+
+    async fn send_cmd(&mut self, cmd: &[u8; 4]) -> Result<TVResponse, Error> {
+        let prefixed_cmd = [0x08, 0x22, cmd[0], cmd[1], cmd[2], cmd[3]];
+        let sum: u32 = prefixed_cmd.iter().map(|x| *x as u32).sum();
+        let checksum: u8 = ((256 - sum) % 256) as u8;
+
+        trace!(">T {:x?}", prefixed_cmd);
+        trace!(">T {:x?}", [checksum]);
+
+        self.port.write_all(&prefixed_cmd).await?;
+        self.port.write_u8(checksum).await?;
+
+        let mut resp_buf = [0u8; 3];
+        match timeout(Duration::from_millis(100), self.port.read_exact(&mut resp_buf)).await {
+            Ok(_) => {
+                trace!("<T {:x?}", resp_buf);
+
+                if resp_buf == [0x03, 0x0c, 0xf1] {
+                    Ok(TVResponse::Ok)
+                } else {
+                    Ok(TVResponse::Unexpected(resp_buf))
+                }
+            }
+            Err(_) => Ok(TVResponse::None)
+        }
     }
 }
 
@@ -235,6 +282,7 @@ pub struct Switcher {
     component: ComponentSwitch,
     hdmi: HDMISwitch,
     tv: TVSwitch,
+    last_selected: String,
 }
 
 impl Switcher {
@@ -250,6 +298,7 @@ impl Switcher {
             tv: TVSwitch {
                 port: Serial::from_path(TV_SWITCH_DEV, &SERIAL_SETTINGS)?,
             },
+            last_selected: "".to_string()
         })
     }
 
@@ -262,29 +311,43 @@ impl Switcher {
                 power_state: false,
             },
             tv: TVSwitch { port: tv },
+            last_selected: "".to_string()
         }
     }
 
-    pub async fn switch_to(&mut self, input_name: &str) -> Result<(), Error> {
+    pub async fn tv_power_status(&mut self) -> Result<bool, Error> {
+        self.tv.power_status().await
+    }
+
+    pub async fn switch_to(&mut self, input_name: &str) -> Result<bool, Error> {
+        // Don't switch to the same input as last switched to
+        if self.last_selected.as_str() == input_name {
+            return Ok(false)
+        }
+
         if let Some(sw) = SWITCH_OPTIONS.get(input_name) {
             let tv_fut = self.tv.switch_to(sw.tv);
-            match sw.input {
+            let result = match sw.input {
                 Some(CompOrHDMI::Component(comp_input)) => try_join![
                     self.component.switch_to(comp_input),
                     self.hdmi.power_off(),
                     tv_fut
                 ]
-                .map(|_| ()),
+                .map(|_| true),
                 Some(CompOrHDMI::HDMI(hdmi_input)) => try_join![
                     self.component.power_off(),
                     self.hdmi.switch_to(hdmi_input),
                     tv_fut
                 ]
-                .map(|_| ()),
+                .map(|_| true),
                 None => {
-                    try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| ())
+                    try_join![self.component.power_off(), self.hdmi.power_off(), tv_fut].map(|_| true)
                 }
+            };
+            if result.is_ok() {
+                self.last_selected = input_name.to_string();
             }
+            result
         } else {
             Err(Error::new(
                 ErrorKind::Other,
@@ -383,8 +446,11 @@ mod tests {
     }
 
     async fn do_tvswitch(input: TVInput, expected_size: usize) -> Result<Vec<u8>, Error> {
-        let (s1, s2) = Serial::pair().unwrap();
+        let (mut s1, s2) = Serial::pair().unwrap();
         let mut sw = TVSwitch { port: s2 };
+        for _ in 0..5 {
+            s1.write_all(&[0x03, 0x0c, 0x1f]).await?;
+        }
         sw.switch_to(input).await?;
         let mut output = Vec::with_capacity(expected_size);
         s1.take(expected_size as u64)
@@ -433,10 +499,13 @@ mod tests {
     ) -> Result<(), Error> {
         let (mut c1, c2) = Serial::pair().unwrap();
         let (h1, h2) = Serial::pair().unwrap();
-        let (t1, t2) = Serial::pair().unwrap();
+        let (mut t1, t2) = Serial::pair().unwrap();
         let mut switcher = Switcher::test_new(c2, h2, t2);
         c1.write_all(comp_response).await?;
-        switcher.switch_to(input).await?;
+        for _ in 0..5 {
+            t1.write_all(&[0x03, 0x0c, 0x1f]).await?;
+        }
+        assert!(switcher.switch_to(input).await?);
         let mut comp_out = Vec::with_capacity(expected_responses[0].len());
         let mut hdmi_out = Vec::with_capacity(expected_responses[1].len());
         let mut tv_out = Vec::with_capacity(expected_responses[2].len());
