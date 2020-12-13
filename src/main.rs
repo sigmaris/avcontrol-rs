@@ -24,7 +24,8 @@ use serial::Switcher;
 
 static MQTT_ADDR: &str = "beefy.sigmaris.info:1883";
 static SWITCH_TOPIC: &str = "avcontrol/switchto";
-static TV_POWER_TOPIC: &str = "avcontrol/tvpower";
+static TV_POWER_STATE_TOPIC: &str = "avcontrol/tv_power_state";
+static TV_POWER_COMMAND_TOPIC: &str = "avcontrol/tv_power_set";
 const KEEP_ALIVE: u16 = 50;
 
 #[cfg(feature = "log_to_syslog")]
@@ -89,11 +90,14 @@ async fn publish_tv_status(
     power: bool
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut status_pkt = PublishPacket::new(
-        TopicName::new(TV_POWER_TOPIC).unwrap(),
+        TopicName::new(TV_POWER_STATE_TOPIC).unwrap(),
         QoSWithPacketIdentifier::Level0,
         if power { "ON" } else { "OFF" }
     );
     status_pkt.set_retain(true);
+
+    trace!("<M PUBLISH {:?}", status_pkt);
+
     let mut buf = Vec::new();
     status_pkt.encode(&mut buf)?;
     writer.write_all(&buf).await?;
@@ -146,17 +150,13 @@ impl Controller {
                     } else {
                         warn!("{:?} is invalid UTF-8", publ.payload_ref());
                     }
-                } else if TV_POWER_TOPIC == publ.topic_name() {
-                    if publ.payload_ref() == b"ON" {
-                        if self.set_tv_power(true).await? {
-                            publish_tv_status(writer, true).await?;
+                } else if TV_POWER_COMMAND_TOPIC == publ.topic_name() {
+                    match publ.payload_ref() {
+                        val if val == b"ON" || val == b"OFF" => {
+                            self.set_tv_power(val == b"ON").await?;
+                            publish_tv_status(writer, self.switcher.tv_power_status(true).await?).await?;
                         }
-                    } else if publ.payload_ref() == b"OFF" {
-                        if self.set_tv_power(false).await? {
-                            publish_tv_status(writer, false).await?;
-                        }
-                    } else {
-                        warn!("Unhandled TV power payload {:?}", publ.payload_ref());
+                        other => warn!("Unhandled TV power payload {:?}", other)
                     }
                 } else {
                     warn!("Unhandled topic {}", publ.topic_name());
@@ -172,14 +172,14 @@ impl Controller {
         power_state: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let power_state_text = if power_state { "on" } else { "off" };
-        if self.switcher.tv_power_status().await? == power_state {
+        if self.switcher.tv_power_status(true).await? == power_state {
             debug!("TV power is already {}", power_state_text);
             Ok(false)
         } else {
             self.lirc_sender.send_power_key().await?;
-            for delay in 0..10 {
+            for delay in 0..15 {
                 delay_for(Duration::from_millis(500)).await;
-                if self.switcher.tv_power_status().await? == power_state {
+                if self.switcher.tv_power_status(false).await? == power_state {
                     return Ok(true);
                 } else {
                     debug!("TV power unchanged after {} ms", delay * 500);
@@ -201,6 +201,8 @@ impl Controller {
                 Err(_) if try_power_on => {
                     debug!("TV is probably powered off, try powering on");
                     self.set_tv_power(true).await?;
+                    // The TV takes an additional 3s to start responding to commands
+                    delay_for(Duration::from_secs(3)).await;
                     return self.switch_to_input(input_name, false, writer).await
                 }
                 Err(err) => {
@@ -234,7 +236,7 @@ impl Controller {
                     QualityOfService::Level0,
                 ),
                 (
-                    TopicFilter::new(TV_POWER_TOPIC).unwrap(),
+                    TopicFilter::new(TV_POWER_COMMAND_TOPIC).unwrap(),
                     QualityOfService::Level0,
                 ),
             ],
@@ -244,7 +246,7 @@ impl Controller {
         sub.encode(&mut buf)?;
         mqtt_write.write_all(&buf).await?;
 
-        publish_tv_status(&mut mqtt_write, self.switcher.tv_power_status().await?).await?;
+        publish_tv_status(&mut mqtt_write, self.switcher.tv_power_status(true).await?).await?;
 
         let ping_time = Duration::from_secs((KEEP_ALIVE / 2) as u64);
         let mut ping_stream = interval(ping_time);

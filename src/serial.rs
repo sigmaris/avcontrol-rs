@@ -81,7 +81,7 @@ struct TVSwitch {
 }
 
 impl TVSwitch {
-    pub async fn power_status(&mut self) -> Result<bool, Error> {
+    pub async fn power_status(&mut self, any_response: bool) -> Result<bool, Error> {
         #[cfg(not(test))]
         self.port.clear(ClearBuffer::Input)?;
 
@@ -89,9 +89,11 @@ impl TVSwitch {
         if response == TVResponse::None {
             // Empty response indicates TV is Off
             Ok(false)
-        } else {
+        } else if any_response {
             // Anything else indicates TV is on
             Ok(true)
+        } else {
+            Ok(response == TVResponse::Ok)
         }
     }
 
@@ -130,7 +132,7 @@ impl TVSwitch {
                 TVResponse::None => return Err(Error::new(ErrorKind::Other, "No response from TV, probably powered off")),
                 TVResponse::Unexpected(ref buf) => warn!("Unexpected response from TV: {:?}", buf),
             }
-            
+
             if delay {
                 delay_for(Duration::from_millis(500)).await
             }
@@ -315,8 +317,8 @@ impl Switcher {
         }
     }
 
-    pub async fn tv_power_status(&mut self) -> Result<bool, Error> {
-        self.tv.power_status().await
+    pub async fn tv_power_status(&mut self, any_response_ok: bool) -> Result<bool, Error> {
+        self.tv.power_status(any_response_ok).await
     }
 
     pub async fn switch_to(&mut self, input_name: &str) -> Result<bool, Error> {
