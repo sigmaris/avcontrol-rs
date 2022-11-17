@@ -1,31 +1,54 @@
-use log::{debug, info, trace, warn};
 use futures::future::{BoxFuture, FutureExt};
+use log::{debug, info, trace, warn};
 use mqtt::control::variable_header::ConnectReturnCode;
 use mqtt::encodable::{Decodable, Encodable};
 use mqtt::packet::{
-    ConnackPacket, ConnectPacket, DisconnectPacket, Packet, PingreqPacket, PingrespPacket,
-    SubscribePacket, VariablePacket, PublishPacket, publish::QoSWithPacketIdentifier
+    publish::QoSWithPacketIdentifier, ConnackPacket, ConnectPacket, DisconnectPacket,
+    PingreqPacket, PingrespPacket, PublishPacket, SubscribePacket, VariablePacket,
 };
 use mqtt::{QualityOfService, TopicFilter, TopicName};
+use serde::Serialize;
 use std::io::{Cursor, Error, ErrorKind};
-use std::net::Shutdown;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::WriteHalf, TcpStream};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::stream::StreamExt;
-use tokio::time::{delay_for, interval};
+use tokio::time::{sleep, interval};
 
 mod lirc;
 use lirc::LircSender;
 mod serial;
 use serial::Switcher;
+use serial::get_switch_options;
 
 static MQTT_ADDR: &str = "beefy.sigmaris.info:1883";
+static DISCOVERY_TOPIC: &str = "homeassistant/select/living_room_input/config";
+static OBJECT_ID: &str = "living_room_input";
+static AVAIL_TOPIC: &str = "avcontrol/availability";
 static SWITCH_TOPIC: &str = "avcontrol/switchto";
+static STATE_TOPIC: &str = "avcontrol/state";
 static TV_POWER_STATE_TOPIC: &str = "avcontrol/tv_power_state";
 static TV_POWER_COMMAND_TOPIC: &str = "avcontrol/tv_power_set";
+
+#[derive(Serialize)]
+struct Availability<'a> {
+    topic: &'a str,
+}
+
+#[derive(Serialize)]
+struct DiscoveryConfig<'a> {
+    availability: Availability<'a>,
+    command_topic: &'a str,
+    icon: &'a str,
+    name: &'a str,
+    object_id: &'a str,
+    options: Vec<&'a str>,
+    retain: bool,
+    state_topic: &'a str,
+    unique_id: &'a str,
+}
+
 const KEEP_ALIVE: u16 = 50;
 
 #[cfg(feature = "log_to_syslog")]
@@ -58,9 +81,15 @@ fn log_init() -> Result<(), Box<dyn std::error::Error>> {
 async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect(MQTT_ADDR).await?;
     debug!("Connected TcpStream");
-    let mut cp = ConnectPacket::new("MQTT", "avcontrol-rs");
+    let mut cp = ConnectPacket::new("avcontrol-rs");
     cp.set_clean_session(true);
     cp.set_keep_alive(KEEP_ALIVE);
+    // Send a last will availability message when we go offline
+    cp.set_will(Some((
+        TopicName::new(AVAIL_TOPIC).unwrap(),
+        "offline".into(),
+    )));
+    cp.set_will_retain(true);
 
     trace!(">M CONNECT {:?}", cp);
 
@@ -87,14 +116,47 @@ async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
 
 async fn publish_tv_status(
     writer: &mut WriteHalf<'_>,
-    power: bool
+    power: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    publish(
+        writer,
+        TV_POWER_STATE_TOPIC,
+        if power { "ON" } else { "OFF" },
+        true,
+    )
+    .await
+}
+
+async fn publish_disco(writer: &mut WriteHalf<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let disco = DiscoveryConfig {
+        availability: Availability { topic: AVAIL_TOPIC },
+        command_topic: SWITCH_TOPIC,
+        icon: "mdi:television",
+        name: "TV Input",
+        object_id: OBJECT_ID,
+        options: get_switch_options(),
+        retain: false,
+        state_topic: STATE_TOPIC,
+        unique_id: OBJECT_ID,
+    };
+    publish(writer, DISCOVERY_TOPIC, serde_json::to_vec(&disco).unwrap(), true).await
+}
+
+async fn publish<P>(
+    writer: &mut WriteHalf<'_>,
+    topic: &str,
+    payload: P,
+    retain: bool,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    P: Into<Vec<u8>>,
+{
     let mut status_pkt = PublishPacket::new(
-        TopicName::new(TV_POWER_STATE_TOPIC).unwrap(),
+        TopicName::new(topic).unwrap(),
         QoSWithPacketIdentifier::Level0,
-        if power { "ON" } else { "OFF" }
+        payload,
     );
-    status_pkt.set_retain(true);
+    status_pkt.set_retain(retain);
 
     trace!("<M PUBLISH {:?}", status_pkt);
 
@@ -105,6 +167,8 @@ async fn publish_tv_status(
 }
 
 async fn send_disconnect(writer: &mut WriteHalf<'_>) {
+    publish(writer, AVAIL_TOPIC, "offline", true).await.ok();
+
     let disconn = DisconnectPacket::new();
     trace!(">M DISCONNECT {:?}", disconn);
     let mut buf = Vec::new();
@@ -141,22 +205,23 @@ impl Controller {
                 debug!(
                     "Received on topic {}: {:?}",
                     publ.topic_name(),
-                    publ.payload_ref()
+                    publ.payload()
                 );
                 if SWITCH_TOPIC == publ.topic_name() {
                     // Switch AV input
-                    if let Ok(input_name) = std::str::from_utf8(publ.payload_ref()) {
+                    if let Ok(input_name) = std::str::from_utf8(publ.payload()) {
                         self.switch_to_input(input_name, true, writer).await?;
                     } else {
-                        warn!("{:?} is invalid UTF-8", publ.payload_ref());
+                        warn!("{:?} is invalid UTF-8", publ.payload());
                     }
                 } else if TV_POWER_COMMAND_TOPIC == publ.topic_name() {
-                    match publ.payload_ref() {
+                    match publ.payload() {
                         val if val == b"ON" || val == b"OFF" => {
                             self.set_tv_power(val == b"ON").await?;
-                            publish_tv_status(writer, self.switcher.tv_power_status(true).await?).await?;
+                            publish_tv_status(writer, self.switcher.tv_power_status(true).await?)
+                                .await?;
                         }
-                        other => warn!("Unhandled TV power payload {:?}", other)
+                        other => warn!("Unhandled TV power payload {:?}", other),
                     }
                 } else {
                     warn!("Unhandled topic {}", publ.topic_name());
@@ -178,14 +243,17 @@ impl Controller {
         } else {
             self.lirc_sender.send_power_key().await?;
             for delay in 0..15 {
-                delay_for(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(500)).await;
                 if self.switcher.tv_power_status(false).await? == power_state {
                     return Ok(true);
                 } else {
                     debug!("TV power unchanged after {} ms", delay * 500);
                 }
             }
-            Err(Box::new(std::io::Error::new(ErrorKind::Other, "Timed out waiting for TV to change power state")))
+            Err(Box::new(std::io::Error::new(
+                ErrorKind::Other,
+                "Timed out waiting for TV to change power state",
+            )))
         }
     }
 
@@ -202,8 +270,8 @@ impl Controller {
                     debug!("TV is probably powered off, try powering on");
                     self.set_tv_power(true).await?;
                     // The TV takes an additional 3s to start responding to commands
-                    delay_for(Duration::from_secs(3)).await;
-                    return self.switch_to_input(input_name, false, writer).await
+                    sleep(Duration::from_secs(3)).await;
+                    return self.switch_to_input(input_name, false, writer).await;
                 }
                 Err(err) => {
                     warn!("Error switching to {}: {}", input_name, err);
@@ -215,17 +283,16 @@ impl Controller {
                         debug!("Already switched to {}", input_name);
                     }
                     tv_power_on = true;
+                    publish(writer, STATE_TOPIC, input_name, true).await?;
                 }
             }
             publish_tv_status(writer, tv_power_on).await?;
             Ok(())
-        }.boxed()
+        }
+        .boxed()
     }
 
-    async fn main_loop(
-        &mut self,
-        mut stream: TcpStream,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn main_loop(&mut self, mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
         let (mut mqtt_read, mut mqtt_write) = stream.split();
         let packet_id: u16 = rand::random();
         let sub = SubscribePacket::new(
@@ -246,13 +313,15 @@ impl Controller {
         sub.encode(&mut buf)?;
         mqtt_write.write_all(&buf).await?;
 
+        publish_disco(&mut mqtt_write).await?;
+        publish(&mut mqtt_write, AVAIL_TOPIC, "online", true).await?;
         publish_tv_status(&mut mqtt_write, self.switcher.tv_power_status(true).await?).await?;
 
         let ping_time = Duration::from_secs((KEEP_ALIVE / 2) as u64);
         let mut ping_stream = interval(ping_time);
         loop {
             select! {
-                Some(_) = ping_stream.next() => {
+                _ = ping_stream.tick() => {
                     debug!("Sending PINGREQ to broker");
                     let pingreq = PingreqPacket::new();
                     trace!(">M PINGREQ {:?}", pingreq);
@@ -260,12 +329,12 @@ impl Controller {
                     pingreq.encode(&mut buf).unwrap();
                     mqtt_write.write_all(&buf).await?
                 }
-                Some(_) = self.sigint.next() => {
+                Some(_) = self.sigint.recv() => {
                     debug!("Caught SIGINT");
                     send_disconnect(&mut mqtt_write).await;
                     return Ok(());
                 }
-                Some(_) = self.sigterm.next() => {
+                Some(_) = self.sigterm.recv() => {
                     debug!("Caught SIGTERM");
                     send_disconnect(&mut mqtt_write).await;
                     return Ok(());
@@ -277,10 +346,9 @@ impl Controller {
                 else => break
             }
         }
-        stream.shutdown(Shutdown::Both).ok();
+        stream.shutdown().await?;
         Ok(())
     }
-
 }
 
 #[tokio::main]
@@ -288,7 +356,9 @@ async fn main() {
     log_init().expect("Failed logger init");
     let mut controller = Controller {
         switcher: serial::Switcher::new().expect("Couldn't open serial ports"),
-        lirc_sender: LircSender::find_device().await.expect("Couldn't open LIRC sender"),
+        lirc_sender: LircSender::find_device()
+            .await
+            .expect("Couldn't open LIRC sender"),
         sigint: signal(SignalKind::interrupt()).expect("Can't listen for SIGINT"),
         sigterm: signal(SignalKind::terminate()).expect("Can't listen for SIGTERM"),
     };
@@ -296,13 +366,13 @@ async fn main() {
         let mut result = connect().await;
         while result.is_err() {
             warn!("MQTT Connect failed, retrying: {:?}", result);
-            delay_for(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             result = connect().await;
         }
         let ended = controller.main_loop(result.unwrap()).await;
         if ended.is_err() {
             info!("Main loop ended, reconnecting: {:?}", ended);
-            delay_for(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(1)).await;
         } else {
             break;
         }
