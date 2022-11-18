@@ -16,15 +16,15 @@ const COMP_SWITCH_DEV: &str = "/dev/compswitch";
 const HDMI_SWITCH_DEV: &str = "/dev/hdmiswitch";
 const TV_SWITCH_DEV: &str = "/dev/tvserial";
 static SWITCH_OPTIONS: phf::Map<&'static str, SwitchOption> = phf_map! {
-    "PS2" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::PS2)), tv: TVInput::Component },
-    "Wii" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Wii)), tv: TVInput::Component },
-    "External" =>      SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::External)),      tv: TVInput::HDMI1 },
-    "Switch" =>        SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Switch)),        tv: TVInput::HDMI1 },
-    "PS4" =>           SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::PS4)),           tv: TVInput::HDMI1 },
-    "Fire TV Stick" => SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::FireTVStick)),   tv: TVInput::HDMI1 },
-    "Dreamcast" =>     SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Dreamcast)),     tv: TVInput::HDMI1 },
-    "Kodi" =>          SwitchOption { input: None, tv: TVInput::HDMI2 },
-    "SCART" =>         SwitchOption { input: None, tv: TVInput::SCART },
+    "PS2" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::PS2)), tv: TVInput::Component, aspect: AspectRatio::FourToThree },
+    "Wii" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Wii)), tv: TVInput::Component, aspect: AspectRatio::SixteenToNine },
+    "External" =>      SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::External)),      tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Switch" =>        SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Switch)),        tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "PS4" =>           SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::PS4)),           tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Fire TV Stick" => SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::FireTVStick)),   tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Dreamcast" =>     SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Dreamcast)),     tv: TVInput::HDMI1,     aspect: AspectRatio::FourToThree },
+    "Kodi" =>          SwitchOption { input: None, tv: TVInput::HDMI2, aspect: AspectRatio::SixteenToNine },
+    "SCART" =>         SwitchOption { input: None, tv: TVInput::SCART, aspect: AspectRatio::FourToThree },
 };
 
 #[derive(Copy, Clone, IntoPrimitive, TryFromPrimitive)]
@@ -59,9 +59,17 @@ pub enum CompOrHDMI {
     HDMI(HDMIInput),
 }
 
+#[derive(Copy, Clone, IntoPrimitive, TryFromPrimitive)]
+#[repr(u8)]
+pub enum AspectRatio {
+    SixteenToNine = 0x00,
+    FourToThree = 0x04,
+}
+
 pub struct SwitchOption {
     pub input: Option<CompOrHDMI>,
     pub tv: TVInput,
+    pub aspect: AspectRatio,
 }
 
 #[derive(Debug, PartialEq)]
@@ -96,45 +104,42 @@ impl TVSwitch {
         #[cfg(not(test))]
         self.port.clear(ClearBuffer::Input)?;
 
-        let mut delay = false;
-        let codes: Vec<[u8; 4]> = match input {
+        let code: [u8; 4] = match input {
             TVInput::SCART => {
-                // If not running unit tests, delay between each command to let the TV respond
-                delay = !cfg!(test);
-                // Send a sequence of commands to switch to SCART and set 4:3 mode
-                vec![
-                    [0x0d, 0x00, 0x00, 0x84], // switch to AV1 (SCART)
-                    [0x0b, 0x0a, 0x01, 0x04], // Set 4:3 mode
-                ]
+                [0x0d, 0x00, 0x00, 0x84] // KEY_AV1 (switches to SCART)
             }
             other => {
                 let other_bytes: u16 = other.into();
                 // Bytes 1&2 are always 0x0a 0x00, byte 3 is source and 4 is index (e.g. 0/1 for HDMI1/2)
-                vec![[
+                [
                     0x0a,
                     0x00,
                     ((other_bytes & 0xff00) >> 8) as u8,
                     (other_bytes & 0xff) as u8,
-                ]]
+                ]
             }
         };
-        for code in codes {
-            match self.send_cmd(&code).await? {
-                TVResponse::Ok => {}
-                TVResponse::None => {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        "No response from TV, probably powered off",
-                    ))
-                }
-                TVResponse::Unexpected(ref buf) => warn!("Unexpected response from TV: {:?}", buf),
-            }
+        self.send_and_handle(code).await?;
 
-            if delay {
-                sleep(Duration::from_millis(1500)).await
-            }
-        }
         Ok(())
+    }
+
+    async fn send_and_handle(&mut self, code: [u8; 4]) -> Result<(), Error> {
+        Ok(match self.send_cmd(&code).await? {
+            TVResponse::Ok => {}
+            TVResponse::None => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    "No response from TV, probably powered off",
+                ))
+            }
+            TVResponse::Unexpected(ref buf) => warn!("Unexpected response from TV: {:?}", buf),
+        })
+    }
+
+    async fn set_aspect(&mut self, aspect: AspectRatio) -> Result<(), Error> {
+        self.send_and_handle([0x0b, 0x0a, 0x01, aspect.into()])
+            .await
     }
 
     async fn send_cmd(&mut self, cmd: &[u8; 4]) -> Result<TVResponse, Error> {
@@ -354,6 +359,10 @@ impl Switcher {
             };
             if result.is_ok() {
                 self.last_selected = input_name.to_string();
+                if !cfg!(test) {
+                    sleep(Duration::from_millis(1500)).await;
+                }
+                self.tv.set_aspect(sw.aspect).await?;
             }
             result
         } else {
@@ -504,12 +513,10 @@ mod tests {
             vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6]
         );
 
-        let f4 = do_tvswitch(TVInput::SCART, 14);
+        let f4 = do_tvswitch(TVInput::SCART, 7);
         assert_eq!(
             rt.block_on(f4).unwrap(),
-            vec![
-                0x08, 0x22, 0x0d, 0x00, 0x00, 0x84, 0x45, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x04, 0xbc,
-            ]
+            vec![0x08, 0x22, 0x0d, 0x00, 0x00, 0x84, 0x45,]
         );
     }
 
@@ -555,7 +562,10 @@ mod tests {
             [
                 vec![0x05, 0x00, 0x01, 0x91],
                 "poweroffR".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x03, 0x00, 0xc9, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x04,
+                    0xbc,
+                ],
             ],
         ))
         .unwrap();
@@ -588,7 +598,10 @@ mod tests {
             [
                 vec![0x04, 0x00],
                 "poweronRport1R".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x00,
+                    0xc0,
+                ],
             ],
         ))
         .unwrap();
@@ -599,7 +612,10 @@ mod tests {
             [
                 vec![0x04, 0x00],
                 "poweronRport2R".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x00,
+                    0xc0,
+                ],
             ],
         ))
         .unwrap();
@@ -610,7 +626,10 @@ mod tests {
             [
                 vec![0x04, 0x00],
                 "poweronRport3R".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x00,
+                    0xc0,
+                ],
             ],
         ))
         .unwrap();
@@ -621,7 +640,10 @@ mod tests {
             [
                 vec![0x04, 0x00],
                 "poweronRport4R".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x00, 0xc7, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x04,
+                    0xbc,
+                ],
             ],
         ))
         .unwrap();
@@ -632,7 +654,10 @@ mod tests {
             [
                 vec![0x04, 0x00],
                 "poweroffR".into(),
-                vec![0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6],
+                vec![
+                    0x08, 0x22, 0x0a, 0x00, 0x05, 0x01, 0xc6, 0x08, 0x22, 0x0b, 0x0a, 0x01, 0x00,
+                    0xc0,
+                ],
             ],
         ))
         .unwrap();
