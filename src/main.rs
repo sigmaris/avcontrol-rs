@@ -14,13 +14,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{tcp::WriteHalf, TcpStream};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::time::{sleep, interval};
+use tokio::time::{interval, sleep};
 
-mod lirc;
-use lirc::LircSender;
 mod serial;
-use serial::Switcher;
 use serial::get_switch_options;
+use serial::Switcher;
 
 static MQTT_ADDR: &str = "beefy.sigmaris.info:1883";
 static DISCOVERY_TOPIC: &str = "homeassistant/select/living_room_input/config";
@@ -139,7 +137,13 @@ async fn publish_disco(writer: &mut WriteHalf<'_>) -> Result<(), Box<dyn std::er
         state_topic: STATE_TOPIC,
         unique_id: OBJECT_ID,
     };
-    publish(writer, DISCOVERY_TOPIC, serde_json::to_vec(&disco).unwrap(), true).await
+    publish(
+        writer,
+        DISCOVERY_TOPIC,
+        serde_json::to_vec(&disco).unwrap(),
+        true,
+    )
+    .await
 }
 
 async fn publish<P>(
@@ -178,7 +182,6 @@ async fn send_disconnect(writer: &mut WriteHalf<'_>) {
 
 struct Controller {
     switcher: Switcher,
-    lirc_sender: LircSender,
     sigint: tokio::signal::unix::Signal,
     sigterm: tokio::signal::unix::Signal,
 }
@@ -210,18 +213,9 @@ impl Controller {
                 if SWITCH_TOPIC == publ.topic_name() {
                     // Switch AV input
                     if let Ok(input_name) = std::str::from_utf8(publ.payload()) {
-                        self.switch_to_input(input_name, true, writer).await?;
+                        self.switch_to_input(input_name, writer).await?;
                     } else {
                         warn!("{:?} is invalid UTF-8", publ.payload());
-                    }
-                } else if TV_POWER_COMMAND_TOPIC == publ.topic_name() {
-                    match publ.payload() {
-                        val if val == b"ON" || val == b"OFF" => {
-                            self.set_tv_power(val == b"ON").await?;
-                            publish_tv_status(writer, self.switcher.tv_power_status(true).await?)
-                                .await?;
-                        }
-                        other => warn!("Unhandled TV power payload {:?}", other),
                     }
                 } else {
                     warn!("Unhandled topic {}", publ.topic_name());
@@ -232,47 +226,14 @@ impl Controller {
         Ok(())
     }
 
-    async fn set_tv_power(
-        &mut self,
-        power_state: bool,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        let power_state_text = if power_state { "on" } else { "off" };
-        if self.switcher.tv_power_status(true).await? == power_state {
-            debug!("TV power is already {}", power_state_text);
-            Ok(false)
-        } else {
-            self.lirc_sender.send_power_key().await?;
-            for delay in 0..15 {
-                sleep(Duration::from_millis(500)).await;
-                if self.switcher.tv_power_status(false).await? == power_state {
-                    return Ok(true);
-                } else {
-                    debug!("TV power unchanged after {} ms", delay * 500);
-                }
-            }
-            Err(Box::new(std::io::Error::new(
-                ErrorKind::Other,
-                "Timed out waiting for TV to change power state",
-            )))
-        }
-    }
-
     fn switch_to_input<'a>(
         &'a mut self,
         input_name: &'a str,
-        try_power_on: bool,
         writer: &'a mut WriteHalf<'_>,
     ) -> BoxFuture<'a, Result<(), Box<dyn std::error::Error>>> {
         async move {
             let mut tv_power_on = false;
             match self.switcher.switch_to(input_name).await {
-                Err(_) if try_power_on => {
-                    debug!("TV is probably powered off, try powering on");
-                    self.set_tv_power(true).await?;
-                    // The TV takes an additional 3s to start responding to commands
-                    sleep(Duration::from_secs(3)).await;
-                    return self.switch_to_input(input_name, false, writer).await;
-                }
                 Err(err) => {
                     warn!("Error switching to {}: {}", input_name, err);
                 }
@@ -356,9 +317,6 @@ async fn main() {
     log_init().expect("Failed logger init");
     let mut controller = Controller {
         switcher: serial::Switcher::new().expect("Couldn't open serial ports"),
-        lirc_sender: LircSender::find_device()
-            .await
-            .expect("Couldn't open LIRC sender"),
         sigint: signal(SignalKind::interrupt()).expect("Can't listen for SIGINT"),
         sigterm: signal(SignalKind::terminate()).expect("Can't listen for SIGTERM"),
     };
