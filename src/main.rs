@@ -20,7 +20,6 @@ mod serial;
 use serial::get_switch_options;
 use serial::Switcher;
 
-static MQTT_ADDR: &str = "beefy.sigmaris.info:1883";
 static DISCOVERY_TOPIC: &str = "homeassistant/select/living_room_input/config";
 static OBJECT_ID: &str = "living_room_input";
 static AVAIL_TOPIC: &str = "avcontrol/availability";
@@ -77,7 +76,7 @@ fn log_init() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn connect() -> Result<TcpStream, Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect(MQTT_ADDR).await?;
+    let mut stream = TcpStream::connect(std::env::var("MQTT_ADDR")?).await?;
     debug!("Connected TcpStream");
     let mut cp = ConnectPacket::new("avcontrol-rs");
     cp.set_clean_session(true);
