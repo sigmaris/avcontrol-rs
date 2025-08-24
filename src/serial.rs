@@ -16,13 +16,13 @@ const COMP_SWITCH_DEV: &str = "/dev/compswitch";
 const HDMI_SWITCH_DEV: &str = "/dev/hdmiswitch";
 const TV_SWITCH_DEV: &str = "/dev/tvserial";
 static SWITCH_OPTIONS: phf::Map<&'static str, SwitchOption> = phf_map! {
-    "PS2" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::PS2)), tv: TVInput::Component, aspect: AspectRatio::FourToThree },
-    "Wii" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Wii)), tv: TVInput::Component, aspect: AspectRatio::SixteenToNine },
-    "External" =>      SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::External)),      tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
-    "Switch" =>        SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Switch)),        tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
-    "PS4" =>           SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::PS4)),           tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
-    "Fire TV Stick" => SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::FireTVStick)),   tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
-    "Dreamcast" =>     SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Dreamcast)),     tv: TVInput::HDMI1,     aspect: AspectRatio::FourToThree },
+    "PS2" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::PS2)),       tv: TVInput::Component, aspect: AspectRatio::FourToThree },
+    "Wii" =>           SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Wii)),       tv: TVInput::Component, aspect: AspectRatio::SixteenToNine },
+    "External" =>      SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::External)),            tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Switch" =>        SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::Switch)),              tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "PS4" =>           SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::PS4)),                 tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Fire TV Stick" => SwitchOption { input: Some(CompOrHDMI::HDMI(HDMIInput::FireTVStick)),         tv: TVInput::HDMI1,     aspect: AspectRatio::SixteenToNine },
+    "Dreamcast" =>     SwitchOption { input: Some(CompOrHDMI::Component(ComponentInput::Dreamcast)), tv: TVInput::PC,        aspect: AspectRatio::FourToThree },
     "Kodi" =>          SwitchOption { input: None, tv: TVInput::HDMI2, aspect: AspectRatio::SixteenToNine },
     "SCART" =>         SwitchOption { input: None, tv: TVInput::SCART, aspect: AspectRatio::FourToThree },
 };
@@ -34,6 +34,7 @@ pub enum TVInput {
     HDMI1 = 0x500,
     HDMI2 = 0x501,
     SCART,
+    PC,
 }
 
 #[derive(Copy, Clone, IntoPrimitive, TryFromPrimitive)]
@@ -41,6 +42,7 @@ pub enum TVInput {
 pub enum ComponentInput {
     PS2 = 1,
     Wii = 2,
+    Dreamcast = 3,
 }
 
 #[derive(Copy, Clone, IntoPrimitive, TryFromPrimitive)]
