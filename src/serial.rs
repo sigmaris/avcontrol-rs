@@ -7,10 +7,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio::try_join;
-use tokio_serial::{
-    ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, SerialStream,
-    StopBits,
-};
+#[cfg(not(test))]
+use tokio_serial::{ClearBuffer, SerialPort};
+use tokio_serial::{DataBits, FlowControl, Parity, SerialPortBuilderExt, SerialStream, StopBits};
 
 const COMP_SWITCH_DEV: &str = "/dev/compswitch";
 const HDMI_SWITCH_DEV: &str = "/dev/hdmiswitch";
